@@ -181,6 +181,43 @@ SHOWPIECE_SPEC = {
     "member_discount": 1.0,
 }
 
+# 凑单跨档演示：同一店铺同一天同一活动的两个软装货号共用这套两档满减。
+# 单件都不到 300（独立口径不触发），整单合计跨进 300 档，n=2 整单再跨到 600 档；
+# 满减按整单累计后依各货号原价占比分摊。选 base 桶 decor SKU（hold 规则，不产跟价建议，
+# 不改变 42 条建议口径），由 build_snapshot 按本常量打标。
+CROSS_TIER_SHOP_CODE = "tb-beian"
+CROSS_TIER_TIERS = [
+    {"threshold": 300.0, "minus": 40.0},
+    {"threshold": 600.0, "minus": 90.0},
+]
+
+
+def _cross_tier_indexes() -> list[int]:
+    """北岸家居店（index % 6 == 1）下两个页面价低于 300 的 base 桶软装货号。
+
+    单件都不到 300（独立口径满减不触发、保留原价），两件整单约 300~600 跨进 300 档，
+    n=2 整单再跨到 600 档，凑单跨档效果可直接在页面核对。
+    """
+    shop_index = COMPETITORS.index(next(c for c in COMPETITORS if c["code"] == CROSS_TIER_SHOP_CODE))
+    picked: list[int] = []
+    for index in range(SKU_COUNT):
+        if index % len(COMPETITORS) != shop_index:
+            continue
+        if index % len(CATEGORIES) != CATEGORIES.index("decor"):
+            continue
+        category = CATEGORIES[index % len(CATEGORIES)]
+        low, _high = CATEGORY_BASE[category]
+        base = low + (index * 37) % max(1, _high - low)
+        if float(round(base)) >= 300.0:
+            continue
+        picked.append(index)
+        if len(picked) >= 2:
+            break
+    return picked
+
+
+CROSS_TIER_INDEXES = _cross_tier_indexes()
+
 # 三类跟价桶：竞品券后价因子（相对我方当前价），成本/底价/目标毛利占比
 BUCKETS = {
     "high": {"factors": (0.84, 0.86, 0.88), "cost": 0.86, "floor": 0.90, "margin": 12.0},
@@ -273,7 +310,17 @@ def build_snapshot(sku: dict, day_offset: int) -> dict:
         }
 
     current = sku["current_price"]
-    if sku["bucket"] == "base" and sku["index"] % 7 == 0:
+    if sku["index"] in CROSS_TIER_INDEXES:
+        # 凑单跨档演示款：两档满减、无其他券，同店两货号整单归集后跨档（页面价保持 base 桶水平）
+        page = _money(current * factor)
+        spec = {
+            "page_price": page,
+            "full_reduction": [dict(tier) for tier in CROSS_TIER_TIERS],
+            "shop_coupon": None,
+            "platform_coupon": None,
+            "member_discount": 1.0,
+        }
+    elif sku["bucket"] == "base" and sku["index"] % 7 == 0:
         # 一部分常规 SKU 叠加会员 95 折：把页面价抬高，使券后价≈我方当前价（不给跟价建议）
         page = _money(current / 0.95)
         spec = {

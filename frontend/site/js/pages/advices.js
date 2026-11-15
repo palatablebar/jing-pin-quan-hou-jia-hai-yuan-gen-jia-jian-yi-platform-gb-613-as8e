@@ -8,13 +8,32 @@ const state = { status: '', risk: '', q: '' };
 function snapshotBlock(payload) {
   const snapshot = payload.snapshot;
   if (!snapshot) return '<p class="muted">这条建议没有关联快照。</p>';
+  const allocation = snapshot.order_allocation;
+  const baseline = snapshot.standalone_baseline;
+  const allocationRows = allocation
+    ? kv([
+        ['整单归集', `${esc(allocation.tier_label || '未达门槛')} · 组内 ${allocation.scope?.group_size || 0} 个货号 · 状态 ${esc(allocation.status || '')}`],
+        ['整单应减额（1 件档）', `<span class="money">−${money(allocation.by_units?.['1']?.group_minus)}</span>`],
+        ['本货号原价占比', (allocation.members || []).find((m) => m.snapshot_id === snapshot.id)
+          ? `${Number((allocation.members || []).find((m) => m.snapshot_id === snapshot.id).original_share_pct).toFixed(2)}%`
+          : '—'],
+        ['跨档前后价差', baseline?.cross_unit_price_diff
+          ? (baseline.cross_unit_price_diff || []).map((d, i) => `${i + 1}件 ${money(d, { sign: true })}`).join(' / ')
+          : '—'],
+        ['独立口径单价（1/2/3 件）', baseline
+          ? `<span class="money">${money(baseline.unit_price_1)} / ${money(baseline.unit_price_2)} / ${money(baseline.unit_price_3)}</span>`
+          : '—'],
+      ])
+      : '<p class="muted">该快照无满减活动，按独立口径还原。</p>';
   return `${kv([
     ['快照日期', esc(snapshot.captured_on)],
     ['页面价', `<span class="money">${money(snapshot.page_price)}</span>`],
     ['券配置', esc(couponText(snapshot))],
-    ['券后 1/2/3 件', `<span class="money">${money(snapshot.unit_price_1)} / ${money(snapshot.unit_price_2)} / ${money(snapshot.unit_price_3)}</span>`],
+    ['券后 1/2/3 件（整单分摊口径）', `<span class="money">${money(snapshot.unit_price_1)} / ${money(snapshot.unit_price_2)} / ${money(snapshot.unit_price_3)}</span>`],
     ['最优件数', snapshot.best_units ? `${snapshot.best_units} 件（${esc(snapshot.note || '')}）` : '—'],
-  ])}`;
+  ])}
+  <div class="section-label">整单满减归集与跨档核对</div>
+  ${allocationRows}`;
 }
 
 function ruleBlock(payload) {

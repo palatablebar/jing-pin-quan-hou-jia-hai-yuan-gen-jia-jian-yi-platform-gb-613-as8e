@@ -26,7 +26,9 @@ class Snapshot(Base):
     stock: Mapped[int] = mapped_column(Integer, default=0)
     campaign: Mapped[str] = mapped_column(String(80), default="")
     source_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # 算法 A 输出：unit_price_1..3 / best / 命中组合说明
+    # 算法 A 输出：unit_price_1..3 / best / 命中组合说明（当前生效口径，可能含整单分摊）
     effective: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 历次重算的口径归档（含独立口径基线），只追加不覆盖，保证旧观测可恢复
+    effective_history: Mapped[list] = mapped_column(JSON, default=list)
     seed_key: Mapped[str | None] = mapped_column(String(120), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

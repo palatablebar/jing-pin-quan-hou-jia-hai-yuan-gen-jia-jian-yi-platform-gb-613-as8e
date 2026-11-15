@@ -19,10 +19,20 @@ logger = logging.getLogger(f"{settings.app_name}.app")
 
 
 def _bootstrap_database() -> None:
+    from sqlalchemy import inspect, text
+
     from src.models import Base  # noqa: WPS433 - 延迟导入避免循环
 
     wait_for_db()
     Base.metadata.create_all(bind=engine)
+    # 轻量幂等补列：老库没有 effective_history 时自动追加（create_all 不会改已存在的表）
+    inspector = inspect(engine)
+    if "snapshots" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("snapshots")}
+        if "effective_history" not in columns:
+            column_type = "JSON" if engine.dialect.name == "postgresql" else "JSON_TEXT"
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE snapshots ADD COLUMN effective_history {column_type}"))
 
 
 def _run_seed_once() -> None:

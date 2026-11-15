@@ -5,6 +5,7 @@ from collections import Counter
 
 from scripts.demo_config import (
     CAPTURE_DAYS,
+    CROSS_TIER_INDEXES,
     FOLLOW_COUNT,
     HIGH_COUNT,
     MEDIUM_COUNT,
@@ -12,7 +13,7 @@ from scripts.demo_config import (
     SHOWPIECE_CODE,
     build_dataset,
 )
-from src.services import effective_price, follow_advice
+from src.services import effective_price, follow_advice, order_allocation
 from src.services.rule_service import match_rule
 from types import SimpleNamespace
 
@@ -90,6 +91,44 @@ def test_showpiece_numbers_are_stable():
     assert len(snapshots) == CAPTURE_DAYS
     effective = effective_price.compute_effective_price(snapshots[0]["spec"])
     assert (effective["unit_price_1"], effective["unit_price_2"], effective["unit_price_3"]) == (279.0, 244.0, 245.67)
+
+
+def test_seed_has_order_level_cross_tier_allocation():
+    """种子里同店同活动的两个软装货号：单件不触发、整单跨档，减额按占比分摊且合计守恒。"""
+    dataset = build_dataset()
+    cross_codes = [dataset["skus"][index]["sku_code"] for index in CROSS_TIER_INDEXES]
+    assert len(cross_codes) == 2
+    snapshots = [
+        item
+        for item in dataset["snapshots"]
+        if item["sku_code"] in cross_codes and item["captured_on_offset"] == 0
+    ]
+    # 独立口径：两货号单件都未达 300 门槛，保留页面原价
+    for item in snapshots:
+        standalone = effective_price.compute_effective_price(item["spec"])
+        assert standalone["unit_price_1"] == item["page_price"]
+    observations = [
+        {
+            "snapshot_id": index + 1,
+            "competitor_id": 2,
+            "captured_on": "2026-11-15",
+            "campaign": item["campaign"],
+            "spec": item["spec"],
+        }
+        for index, item in enumerate(snapshots)
+    ]
+    allocations = order_allocation.allocate_observations(observations)
+    grouped = allocations[1]
+    assert grouped["status"] == "allocated"
+    assert grouped["cross_tier"] is True
+    # n=1 整单跨进 300 档，分摊合计 = 整单应减 40
+    node = grouped["by_units"]["1"]
+    assert node["tier"] == {"threshold": 300.0, "minus": 40.0}
+    assert round(sum(node["allocations"].values()), 2) == 40.0
+    # n=2 整单再跨到 600 档，分摊合计 = 整单应减 90
+    node2 = grouped["by_units"]["2"]
+    assert node2["tier"] == {"threshold": 600.0, "minus": 90.0}
+    assert round(sum(node2["allocations"].values()), 2) == 90.0
 
 
 def test_rule_scope_priority_order():

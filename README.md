@@ -46,11 +46,25 @@
 
 ## 4. 核心算法与口径
 
-### 算法 A｜券后有效价还原（`backend/src/services/effective_price.py`）
+### 算法 A｜券后有效价还原（`backend/src/services/effective_price.py` + `order_allocation.py`）
 
 输入一条快照：页面价 `page_price`、满减阶梯 `full_reduction[{threshold, minus}]`、店铺券 `shop_coupon{threshold, minus, stackable}`、平台跨店券 `platform_coupon{per, minus}`、会员折扣 `member_discount`。
 
-对 `n ∈ {1,2,3}`：
+**满减按整单累计，不再每个货号各算一遍。** 测算时先对每条快照做独立口径还原（作为基线、不落库覆盖），再按 `(竞品店铺, 快照日期, 活动 campaign)` 归集当天观测、按满减阶梯签名分簇，统一选档并把整单减额按各货号原价占比分摊（`order_allocation.py`）：
+
+```
+整单小计(n) = Σ 同组货号 page_price × n
+整单满减档  = 命中「threshold ≤ 整单小计」的最高档（全组统一一档，只叠一档）
+整单应减额  = 该档 minus
+各货号分摊  = 最大余数法按 page_price 占比分摊到分 → Σ 分摊额 == 整单应减额（逐分守恒）
+```
+
+- 店铺券 / 平台跨店券 / 会员折扣仍按各货号本快照独立结算，只有满减走整单。
+- 组内满减阶梯配置不一致时按阶梯签名分簇、回退独立归集并标记 `tier_mismatch`；整单任何件数档都未达门槛的组标记 `below_threshold`，各货号保留页面原价与独立记录；无满减配置的快照不参与归集。
+- 每条快照同时保留 `standalone_baseline`（独立口径 1/2/3 件单价）与 `cross_unit_price_diff`（整单分摊单价 − 独立单价，即跨档前后价差）。
+- 旧观测不覆盖：每次口径变化把上一版 `effective` 追加进 `snapshots.effective_history`（最多留 20 条，只增不删）；重跑同一批结果一致时不重复归档、不新增建议、不改分摊。
+
+对 `n ∈ {1,2,3}`（单条快照独立口径，`compute_effective_price`）：
 
 ```
 subtotal = page_price × n
@@ -61,7 +75,7 @@ payable  = (subtotal − 满减 − 店铺券 − 平台券) × member_discount 
 unit(n)  = payable / n
 ```
 
-输出 `unit_price_1/2/3`、`best_units`、`best_payable`、`note`（命中组合说明）、`discount_pct`、`confidence`。失败态（页面价 ≤ 0、门槛为负、券面 > 门槛、会员折扣越界）返回 `valid=false, error=INVALID_SNAPSHOT`，计入运行指标 `invalid_snapshots`。
+输出 `unit_price_1/2/3`、`best_units`、`best_payable`、`note`（命中组合说明）、`discount_pct`、`confidence`，整单归集口径另含 `order_allocation`（整单档位、组内各货号原价占比、各档分摊额）与 `standalone_baseline`。失败态（页面价 ≤ 0、门槛为负、券面 > 门槛、会员折扣越界）返回 `valid=false, error=INVALID_SNAPSHOT`，计入运行指标 `invalid_snapshots`，且**保留旧观测不覆盖**。
 
 **手算校验（验收口径）**：页面价 299、满 300 减 40、店铺券满 200 减 20、平台每满 300 减 50：
 
@@ -135,7 +149,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 ```text
 backend/
   src/{config,constants,controllers,middlewares,models,routes,schemas,services,utils}
-  src/services/{effective_price,follow_advice,pricing_service,...}.py   # 两个算法是纯函数
+  src/services/{effective_price,order_allocation,follow_advice,pricing_service,...}.py   # 两个算法是纯函数（order_allocation 负责整单满减归集与占比分摊）
   scripts/{seed_demo.py,demo_config.py,worker_healthcheck.sh}
   migrations/001_core_tables.sql   tests/
 frontend/site/
@@ -153,7 +167,7 @@ frontend/site/
 |---|---|---|---|
 | 竞品店铺 `Competitor` | `competitors` | code、name、platform、shop_url、capture_config、last_captured_at | `code` |
 | 自有 SKU `Sku` | `skus` | sku_code、name、category、competitor_id、cost、floor_price、target_margin_pct、current_price | `sku_code` |
-| 抓价快照 `Snapshot` | `snapshots` | sku_id、captured_on、page_price、满减/店铺券/平台券/会员折扣、effective(算法 A) | `(sku_id, captured_on)` |
+| 抓价快照 `Snapshot` | `snapshots` | sku_id、captured_on、page_price、满减/店铺券/平台券/会员折扣、effective(算法 A/整单分摊)、effective_history(旧口径归档) | `(sku_id, captured_on)` |
 | 跟价规则 `Rule` | `rules` | code、scope_kind/scope_value（sku>category>competitor>global）、strategy、target_margin_pct、max_drop_pct、priority | `code` |
 | 跟价建议 `Advice` | `advices` | run_id、sku_id、P10/P25/P50、suggested_price、margin_pct、gap_pct、severity、status、approver | `(run_id, sku_id)` |
 

@@ -104,13 +104,19 @@ def snapshots_csv(db: Session, captured_on=None) -> bytes:
     headers = [
         "快照编号", "快照日期", "SKU编码", "SKU名称", "类目", "竞品店铺",
         "页面价", "满减", "店铺券", "平台券", "会员折扣",
-        "券后1件", "券后2件", "券后3件", "最优件数", "命中组合", "券后折扣%", "采集活动",
+        "券后1件", "券后2件", "券后3件", "最优件数", "命中组合", "券后折扣%",
+        "整单归集状态", "整单档位", "原价占比%", "独立口径1件", "采集活动",
     ]
     rows = []
     for snapshot in snapshots:
         sku = skus.get(snapshot.sku_id)
         competitor = competitors.get(snapshot.competitor_id)
         effective = snapshot.effective or {}
+        allocation = effective.get("order_allocation") or {}
+        share = ""
+        for member in allocation.get("members") or []:
+            if member.get("snapshot_id") == snapshot.id:
+                share = f"{member.get('original_share_pct'):.2f}"
         rows.append(
             [
                 snapshot.id,
@@ -130,6 +136,10 @@ def snapshots_csv(db: Session, captured_on=None) -> bytes:
                 effective.get("best_units") or "",
                 effective.get("note") or "",
                 _fmt(effective.get("discount_pct")),
+                allocation.get("status", "standalone"),
+                allocation.get("tier_label") or "",
+                share,
+                _fmt((effective.get("standalone_baseline") or {}).get("unit_price_1")),
                 snapshot.campaign,
             ]
         )

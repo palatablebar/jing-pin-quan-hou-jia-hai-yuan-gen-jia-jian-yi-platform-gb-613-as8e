@@ -1,6 +1,7 @@
 """抓价快照服务：入库时即做券后价还原（算法 A），列表/详情按角色脱敏。"""
 from __future__ import annotations
 
+import copy
 from datetime import date
 
 from sqlalchemy import func, or_, select
@@ -12,7 +13,10 @@ from src.models.sku import Sku
 from src.models.snapshot import Snapshot
 from src.services import effective_price
 from src.utils.errors import not_found
+from src.utils.jsonutil import json_equal
 from src.utils.timeutil import iso_utc
+
+HISTORY_LIMIT = 20
 
 
 def spec_of(snapshot: Snapshot) -> dict:
@@ -58,13 +62,27 @@ def serialize(db: Session, snapshot: Snapshot, role: str = "viewer", *, detail: 
         "note": effective.get("note"),
         "valid": effective.get("valid", False),
         "warnings": effective.get("warnings") or [],
+        "allocation_status": (effective.get("order_allocation") or {}).get("status"),
+        "allocation_tier_label": (effective.get("order_allocation") or {}).get("tier_label"),
+        "allocation_cross_tier": (effective.get("order_allocation") or {}).get("cross_tier", False),
+        "original_share_pct": _original_share(effective, snapshot.id),
+        "standalone_unit_price_1": (effective.get("standalone_baseline") or {}).get("unit_price_1"),
         "captured_at": iso_utc(snapshot.created_at),
     }
     if detail:
         data["effective"] = effective
+        data["effective_history"] = snapshot.effective_history or []
         data["page_total_n2"] = round(snapshot.page_price * 2, 2)
         data["page_total_n3"] = round(snapshot.page_price * 3, 2)
     return data
+
+
+def _original_share(effective: dict, snapshot_id: int) -> float | None:
+    allocation = effective.get("order_allocation") or {}
+    for member in allocation.get("members") or []:
+        if member.get("snapshot_id") == snapshot_id:
+            return member.get("original_share_pct")
+    return None
 
 
 def _discount_pct(snapshot: Snapshot, effective: dict) -> float:
@@ -130,6 +148,13 @@ def capture_days(db: Session) -> list[str]:
 
 
 def recompute(db: Session, snapshot: Snapshot) -> dict:
+    """单条重算（独立口径）：旧观测追加进 effective_history，不覆盖丢失。"""
     result = effective_price.compute_effective_price(spec_of(snapshot))
+    previous = snapshot.effective or {}
+    if previous and not json_equal(previous, result):
+        history = list(snapshot.effective_history or [])
+        if not history or not json_equal(history[-1], previous):
+            history.append(copy.deepcopy(previous))
+        snapshot.effective_history = history[-HISTORY_LIMIT:]
     snapshot.effective = result
     return result

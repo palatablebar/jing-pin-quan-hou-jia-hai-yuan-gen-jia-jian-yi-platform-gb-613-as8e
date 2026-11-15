@@ -77,6 +77,7 @@ CREATE TABLE snapshots (
     campaign        VARCHAR(80),
     source_url      VARCHAR(255),
     effective       JSON,
+    effective_history JSON,
     seed_key        VARCHAR(120) UNIQUE,
     created_at      TIMESTAMP    NOT NULL,
     CONSTRAINT uq_snapshots_sku_day UNIQUE (sku_id, captured_on)

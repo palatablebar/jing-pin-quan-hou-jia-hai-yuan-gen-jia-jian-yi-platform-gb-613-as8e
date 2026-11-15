@@ -87,6 +87,8 @@ def normalize_spec(spec: dict) -> dict:
         raise ValueError("页面价必须大于 0")
     if page_price > 1_000_000:
         raise ValueError("页面价超出合理区间")
+    # 金额以分为最小单位：统一在入口舍入，避免 JSON 浮点往返（如 SQLite 299→298.99999999999994）污染占比
+    page_price = _money(page_price)
     member_discount = _num(spec.get("member_discount") or 1.0, "member_discount")
     if not (0.5 <= member_discount <= 1.0):
         raise ValueError("会员折扣必须在 0.5~1.0 之间")
@@ -109,20 +111,30 @@ def normalize_spec(spec: dict) -> dict:
     }
 
 
-def _unit_breakdown(norm: dict, units: int) -> dict:
+def _unit_breakdown(norm: dict, units: int, full_minus_override: float | None = None, allocation: dict | None = None) -> dict:
     page = norm["page_price"]
     subtotal = _money(page * units)
     hits: list[str] = []
 
-    full_minus = 0.0
-    tier_hit = None
+    # 独立口径（每个货号各自选档）：始终计算，作为整单归集的对照基线
+    standalone_tier = None
     for tier in norm["full_reduction"]:
         if tier["threshold"] <= subtotal + 1e-9:
-            if tier_hit is None or tier["minus"] >= tier_hit["minus"]:
-                tier_hit = tier
-    if tier_hit is not None:
-        full_minus = tier_hit["minus"]
-        hits.append(f"满{_trim(tier_hit['threshold'])}减{_trim(tier_hit['minus'])}")
+            if standalone_tier is None or tier["minus"] >= standalone_tier["minus"]:
+                standalone_tier = tier
+    standalone_minus = _money(standalone_tier["minus"]) if standalone_tier is not None else 0.0
+
+    # 整单归集口径：注入按原价占比分摊到该货号的满减额；否则沿用独立选档
+    allocated = full_minus_override is not None
+    full_minus = _money(full_minus_override) if allocated else standalone_minus
+    if full_minus > 0:
+        if allocated:
+            group_label = (allocation or {}).get("tier_label") or "整单满减"
+            solo_label = f"满{_trim(standalone_tier['threshold'])}减{_trim(standalone_tier['minus'])}" if standalone_tier else "独立口径未触发"
+            hits.append(f"整单满减分摊（{group_label}）减{_trim(full_minus)}")
+            hits.append(f"独立口径对照：{solo_label}减{_trim(standalone_minus)}")
+        else:
+            hits.append(f"满{_trim(standalone_tier['threshold'])}减{_trim(standalone_tier['minus'])}")
 
     shop = norm["shop_coupon"]
     shop_minus = 0.0
@@ -161,7 +173,17 @@ def _unit_breakdown(norm: dict, units: int) -> dict:
     return {
         "units": units,
         "subtotal": subtotal,
-        "full_reduction": {"applied": full_minus > 0, "minus": _money(full_minus)},
+        "full_reduction": {
+            "applied": full_minus > 0,
+            "minus": _money(full_minus),
+            "allocated": allocated,
+            "standalone_tier": (
+                {"threshold": _money(standalone_tier["threshold"]), "minus": standalone_minus}
+                if standalone_tier is not None
+                else None
+            ),
+            "standalone_minus": standalone_minus,
+        },
         "shop_coupon": {"applied": shop_hit, "minus": _money(shop_minus)},
         "platform_coupon": {"applied": platform_times > 0, "times": platform_times, "minus": _money(platform_minus)},
         "coupon_choice": coupon_choice,
@@ -223,4 +245,67 @@ def compute_effective_price(spec: dict, max_units: int = MAX_UNITS) -> dict:
         "detail": best["note"],
         "warnings": warnings,
         "confidence": 0.99 if not warnings else 0.9,
+    }
+
+
+def compute_effective_price_with_allocation(spec: dict, allocation: dict | None, max_units: int = MAX_UNITS) -> dict:
+    """整单归集口径的券后还原。
+
+    allocation 为 order_allocation 模块对该快照的归集结果：满减不再各自选档，
+    而是注入按原价占比分摊到本货号的减额；店铺券 / 平台券 / 会员折扣仍按本快照
+    独立结算。allocation 为 None 时等同独立口径 compute_effective_price。
+    输出同时保留独立基线 standalone_baseline 与跨档前后价差，便于页面核对。
+    """
+    standalone = compute_effective_price(spec, max_units)
+    if allocation is None:
+        return standalone
+    try:
+        norm = normalize_spec(spec)
+    except (ValueError, TypeError):
+        return standalone
+
+    overrides = allocation.get("full_minus_by_units") or {}
+    breakdowns = [
+        _unit_breakdown(norm, units, full_minus_override=overrides.get(units), allocation=allocation)
+        for units in range(1, min(max_units, MAX_UNITS) + 1)
+    ]
+    best = min(breakdowns, key=lambda item: (item["unit_price"], item["units"]))
+
+    # 跨档前后价差：整单分摊口径单价 − 独立口径单价（负=分摊后更省）
+    cross_diffs = [
+        _money(item["unit_price"] - standalone["units"][i]["unit_price"])
+        for i, item in enumerate(breakdowns)
+    ]
+    notes = [f"{item['units']}件单价 ¥{item['unit_price']}（{item['note']}）" for item in breakdowns]
+    warnings = list(standalone.get("warnings") or [])
+    warnings.extend(allocation.get("warnings") or [])
+    if allocation.get("cross_tier"):
+        warnings.append("该货号独立选档与整单统一档位不一致，已按整单档位分摊（见跨档价差）")
+
+    return {
+        "valid": True,
+        "page_price": norm["page_price"],
+        "units": breakdowns,
+        "unit_price_1": breakdowns[0]["unit_price"],
+        "unit_price_2": breakdowns[1]["unit_price"] if len(breakdowns) > 1 else None,
+        "unit_price_3": breakdowns[2]["unit_price"] if len(breakdowns) > 2 else None,
+        "best_units": best["units"],
+        "best_unit_price": best["unit_price"],
+        "best_payable": best["payable"],
+        "discount_pct": _money((1 - breakdowns[0]["unit_price"] / norm["page_price"]) * 100),
+        "note": "；".join(notes),
+        "detail": best["note"],
+        "warnings": warnings,
+        "confidence": 0.99 if not warnings else 0.9,
+        "allocation_scope": "order",
+        "order_allocation": allocation,
+        "standalone_baseline": {
+            "unit_price_1": standalone.get("unit_price_1"),
+            "unit_price_2": standalone.get("unit_price_2"),
+            "unit_price_3": standalone.get("unit_price_3"),
+            "best_units": standalone.get("best_units"),
+            "best_unit_price": standalone.get("best_unit_price"),
+            "note": standalone.get("note"),
+            "cross_unit_price_diff": cross_diffs,
+        },
     }
